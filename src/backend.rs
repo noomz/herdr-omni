@@ -24,6 +24,7 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const PIPE_KILL_GRACE: Duration = Duration::from_secs(1);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
 
+use crate::config::MachineSources;
 use crate::process::{isolate as start_process_group, terminate as kill_process_group};
 
 fn text(value: Option<&Value>) -> String {
@@ -83,6 +84,14 @@ fn run_herdr_cancellable(args: &[String], cancel: Option<&AtomicBool>) -> Result
     } else {
         Duration::from_secs(5)
     };
+    run_herdr_timed(args, timeout, cancel)
+}
+
+fn run_herdr_timed(
+    args: &[String],
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value, String> {
     let (status, stdout, stderr) = run_command_capture(args, timeout, 4 * 1024 * 1024, cancel)?;
     if !status.success() {
         return Err(explain(&String::from_utf8_lossy(&stderr), status.code()));
@@ -102,6 +111,7 @@ fn run_command_capture(
     let mut command = Command::new(binary());
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     start_process_group(&mut command);
@@ -1827,13 +1837,15 @@ pub fn load_live_items_cancellable(cancel: &AtomicBool) -> Result<Vec<Value>, St
     load_live_items_with_cancel(Some(cancel))
 }
 
+fn snapshot_of(response: &Value) -> Result<&Value, String> {
+    value_at(response, &["result", "snapshot"])
+        .filter(|snapshot| snapshot.get("workspaces").is_some_and(Value::is_array))
+        .ok_or_else(|| "Herdr returned an unreadable session snapshot.".to_string())
+}
+
 fn load_live_items_with_cancel(cancel: Option<&AtomicBool>) -> Result<Vec<Value>, String> {
     let snapshot_response = run_herdr_cancellable(&["api".into(), "snapshot".into()], cancel)?;
-    let snapshot = value_at(&snapshot_response, &["result", "snapshot"])
-        .ok_or_else(|| "Herdr returned an unreadable session snapshot.".to_string())?;
-    if !snapshot.get("workspaces").is_some_and(Value::is_array) {
-        return Err("Herdr returned an unreadable session snapshot.".to_string());
-    }
+    let snapshot = snapshot_of(&snapshot_response)?;
     let current_workspace = launch_context_value()
         .and_then(|value| {
             value
@@ -1884,6 +1896,102 @@ fn load_live_items_with_cancel(cancel: Option<&AtomicBool>) -> Result<Vec<Value>
     Ok(items)
 }
 
+/// Live rows from one saved Herdr machine, or why they could not be read.
+#[derive(Debug)]
+pub struct MachineItems {
+    pub label: String,
+    pub items: Result<Vec<Value>, String>,
+}
+
+/// Fetch live rows from every configured remote machine in parallel. Returns
+/// nothing when machine sources are disabled or Herdr cannot list machines.
+pub fn load_machine_items_cancellable(cancel: &AtomicBool) -> Vec<MachineItems> {
+    match crate::config::machine_sources() {
+        Some(sources) => load_machine_items(&sources, cancel),
+        None => Vec::new(),
+    }
+}
+
+fn load_machine_items(sources: &MachineSources, cancel: &AtomicBool) -> Vec<MachineItems> {
+    let Ok(machines) = run_herdr_cancellable(
+        &["machine".into(), "list".into(), "--json".into()],
+        Some(cancel),
+    ) else {
+        return Vec::new();
+    };
+    let labels = records(Some(&machines))
+        .into_iter()
+        .filter(|machine| machine.get("enabled").and_then(Value::as_bool) == Some(true))
+        .map(|machine| text(machine.get("label")))
+        .filter(|label| !label.is_empty() && sources.includes(label))
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        let fetches = labels
+            .into_iter()
+            .map(|label| {
+                scope.spawn(move || {
+                    let items = load_machine(&label, sources.timeout, cancel);
+                    MachineItems { label, items }
+                })
+            })
+            .collect::<Vec<_>>();
+        fetches
+            .into_iter()
+            .filter_map(|fetch| fetch.join().ok())
+            .collect()
+    })
+}
+
+fn load_machine(label: &str, timeout: Duration, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
+    let response = run_herdr_timed(
+        &on_machine(Some(label), vec!["api".into(), "snapshot".into()]),
+        timeout,
+        Some(cancel),
+    )?;
+    let items = items_from_snapshot_with_visits(snapshot_of(&response)?, "", &HashMap::new());
+    Ok(machine_items(items, label))
+}
+
+/// Remote rows keep their local ids with an `@label` suffix and run every
+/// action through `herdr --machine <label>`. Session and visit data are
+/// dropped because they describe the local box.
+fn machine_items(items: Vec<Value>, label: &str) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            item["id"] = json!(format!("{}@{label}", text(item.get("id"))));
+            if let Some(argv) = item["invocation"]["argv"].as_array_mut() {
+                argv.splice(0..0, [json!("--machine"), json!(label)]);
+            }
+            if let Some(aliases) = item["aliases"].as_array_mut() {
+                aliases.push(json!(label));
+            }
+            if let Some(object) = item.as_object_mut() {
+                for key in [
+                    "session",
+                    "sessionHint",
+                    "lastVisitedAt",
+                    "currentWorkspace",
+                ] {
+                    object.remove(key);
+                }
+                object.insert("machine".into(), json!(label));
+            }
+            item
+        })
+        .collect()
+}
+
+fn on_machine(machine: Option<&str>, args: Vec<String>) -> Vec<String> {
+    match machine {
+        Some(label) => ["--machine".to_string(), label.to_string()]
+            .into_iter()
+            .chain(args)
+            .collect(),
+        None => args,
+    }
+}
+
 fn run_raw(args: &[String], timeout: Duration, max_bytes: usize) -> Result<(i32, Vec<u8>), String> {
     run_raw_cancellable(args, timeout, max_bytes, None)
 }
@@ -1897,6 +2005,7 @@ fn run_raw_cancellable(
     let mut command = Command::new(binary());
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     start_process_group(&mut command);
@@ -2980,6 +3089,136 @@ mod tests {
             "cancellation took too long: {result:?}"
         );
         assert!(result.unwrap_err().contains("cancelled"));
+        std::env::remove_var("HERDR_BIN_PATH");
+        remove_tree(&directory);
+    }
+
+    const MACHINES_SCRIPT: &str = r#"printf '%s\n' "$*" >> 'LOG'
+case "$*" in
+  "machine list --json") printf '%s' '[{"id":"m1","label":"laptop","target":"t1","enabled":true},{"id":"m2","label":"desktop","target":"t2","enabled":true},{"id":"m3","label":"broken","target":"t3","enabled":true},{"id":"m4","label":"spare","target":"t4","enabled":false}]' ;;
+  "--machine laptop api snapshot") printf '%s' '{"result":{"snapshot":{"workspaces":[{"workspace_id":"w1","label":"Shop"}],"tabs":[{"tab_id":"t1","workspace_id":"w1","label":"Build"}],"panes":[{"pane_id":"w1:p1","workspace_id":"w1","tab_id":"t1"}],"agents":[{"agent":"claude","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1","tab_id":"t1","title":"Task","cwd":"/repo","agent_session":{"kind":"id","agent":"claude","value":"session-1"}}]}}}' ;;
+  "--machine desktop api snapshot") sleep 5 ;;
+  "--machine broken api snapshot") printf 'unreachable' >&2; exit 1 ;;
+  *) printf '%s' '{"result":{}}' ;;
+esac"#;
+
+    fn mock_machines(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let directory = temp_path(label);
+        fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("calls");
+        let command = directory.join("herdr");
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\n{}\n",
+                MACHINES_SCRIPT.replace("LOG", log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        assert!(Command::new("chmod")
+            .args(["+x", command.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        (directory, command, log)
+    }
+
+    fn calls(log: &Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn machine_rows_arrive_per_machine_within_the_timeout_budget() {
+        let _guard = env_lock();
+        let (directory, command, log) = mock_machines("machines-fetch");
+        fs::write(
+            directory.join("config.toml"),
+            "[machines]\nenabled = true\ntimeout_ms = 600\n",
+        )
+        .unwrap();
+        std::env::set_var("HERDR_BIN_PATH", &command);
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &directory);
+        let started = std::time::Instant::now();
+        let results = load_machine_items_cancellable(&AtomicBool::new(false));
+        let elapsed = started.elapsed();
+        std::env::remove_var("HERDR_BIN_PATH");
+        std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        let by_label = results
+            .iter()
+            .map(|result| (result.label.as_str(), &result.items))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_label.len(), 3);
+        let laptop = by_label["laptop"].as_ref().unwrap();
+        let agent = laptop
+            .iter()
+            .find(|item| item["category"] == "Agents")
+            .unwrap();
+        assert_eq!(agent["id"], "live:agent:w1:p1@laptop");
+        assert_eq!(agent["machine"], "laptop");
+        assert_eq!(
+            agent["invocation"]["argv"],
+            json!(["--machine", "laptop", "agent", "focus", "w1:p1"])
+        );
+        assert!(agent.get("session").is_none());
+        assert!(agent["aliases"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("laptop")));
+        let workspace = laptop
+            .iter()
+            .find(|item| item["category"] == "Workspace")
+            .unwrap();
+        assert_eq!(workspace["id"], "live:workspace:w1@laptop");
+        assert!(workspace.get("currentWorkspace").is_none());
+        assert!(laptop.iter().all(|item| item["machine"] == "laptop"));
+        assert!(by_label["desktop"]
+            .as_ref()
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(by_label["broken"]
+            .as_ref()
+            .unwrap_err()
+            .contains("unreachable"));
+        assert!(!calls(&log).iter().any(|call| call.contains("spare")));
+        remove_tree(&directory);
+    }
+
+    #[test]
+    fn machine_sources_off_never_calls_herdr() {
+        let _guard = env_lock();
+        let (directory, command, log) = mock_machines("machines-off");
+        std::env::set_var("HERDR_BIN_PATH", &command);
+        std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR");
+        assert!(load_machine_items_cancellable(&AtomicBool::new(false)).is_empty());
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &directory);
+        assert!(load_machine_items_cancellable(&AtomicBool::new(false)).is_empty());
+        fs::write(
+            directory.join("config.toml"),
+            "[machines]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(load_machine_items_cancellable(&AtomicBool::new(false)).is_empty());
+        std::env::remove_var("HERDR_BIN_PATH");
+        std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR");
+        assert!(calls(&log).is_empty());
+        remove_tree(&directory);
+    }
+
+    #[test]
+    fn machine_list_failure_means_no_machines() {
+        let _guard = env_lock();
+        let (directory, command) = mock_herdr_script("machines-old", "exit 2");
+        std::env::set_var("HERDR_BIN_PATH", &command);
+        let sources = MachineSources {
+            include: vec!["*".into()],
+            timeout: Duration::from_millis(300),
+        };
+        assert!(load_machine_items(&sources, &AtomicBool::new(false)).is_empty());
         std::env::remove_var("HERDR_BIN_PATH");
         remove_tree(&directory);
     }
