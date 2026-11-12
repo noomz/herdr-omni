@@ -1184,6 +1184,18 @@ fn unique_suffix() -> String {
     format!("{:08x}", nanos & 0xffff_ffff)
 }
 
+/// Herdr gives plugins no way to switch the client's visible machine, so a
+/// remote focus only lands once the user picks that machine in the sidebar.
+fn remind_machine_switch(label: &str) {
+    let _ = run_herdr(&[
+        "notification".into(),
+        "show".into(),
+        format!("Focused on {label}"),
+        "--body".into(),
+        format!("Switch to {label} in the Herdr sidebar to see it."),
+    ]);
+}
+
 /// Execute one palette item. The returned value is the JSON CommandResult
 /// consumed by the Rust UI (`ok`, `message`, and optional confirmation data).
 pub fn execute(item: &Value, input: &str) -> Value {
@@ -1294,7 +1306,12 @@ pub fn execute(item: &Value, input: &str) -> Value {
                 return focus_pane(args.get(2).map(String::as_str).unwrap_or_default());
             }
             match run_herdr(&args) {
-                Ok(_) => command_result(true, ""),
+                Ok(_) => {
+                    if let Some(label) = item.get("machine").and_then(Value::as_str) {
+                        remind_machine_switch(label);
+                    }
+                    command_result(true, "")
+                }
                 Err(error) => command_result_error(error),
             }
         }
@@ -2185,6 +2202,23 @@ fn preview_pane_id(item: &Value, pane_index: usize) -> Option<String> {
     }
 }
 
+fn pane_read_args(item: &Value, pane_index: usize) -> Result<Vec<String>, String> {
+    let pane =
+        preview_pane_id(item, pane_index).ok_or_else(|| "Pane preview unavailable.".to_string())?;
+    Ok(on_machine(
+        item.get("machine").and_then(Value::as_str),
+        vec![
+            "pane".into(),
+            "read".into(),
+            pane,
+            "--source".into(),
+            "visible".into(),
+            "--format".into(),
+            "text".into(),
+        ],
+    ))
+}
+
 /// Read the selected live pane without changing Herdr focus.
 pub fn preview(item: &Value, pane_index: usize) -> Result<String, String> {
     if let Some(resource) = item.get("resourcePreview") {
@@ -2290,17 +2324,7 @@ pub fn preview(item: &Value, pane_index: usize) -> Result<String, String> {
             return Err("No pane details available".to_string());
         }
     }
-    let pane =
-        preview_pane_id(item, pane_index).ok_or_else(|| "Pane preview unavailable.".to_string())?;
-    let args = vec![
-        "pane".into(),
-        "read".into(),
-        pane,
-        "--source".into(),
-        "visible".into(),
-        "--format".into(),
-        "text".into(),
-    ];
+    let args = pane_read_args(item, pane_index)?;
     let (code, output) =
         run_raw(&args, Duration::from_secs(3), MAX_PREVIEW_BYTES).map_err(|error| {
             if error == "timed out" {
@@ -2331,17 +2355,7 @@ pub fn preview_cancellable(
     }) {
         return preview(item, pane_index);
     }
-    let pane =
-        preview_pane_id(item, pane_index).ok_or_else(|| "Pane preview unavailable.".to_string())?;
-    let args = vec![
-        "pane".into(),
-        "read".into(),
-        pane,
-        "--source".into(),
-        "visible".into(),
-        "--format".into(),
-        "text".into(),
-    ];
+    let args = pane_read_args(item, pane_index)?;
     let (code, output) = run_raw_cancellable(
         &args,
         Duration::from_secs(3),
@@ -2485,6 +2499,7 @@ fn resource_details_with_cancel(
             id.to_string(),
         ]
     };
+    let args = on_machine(target.get("machine").and_then(Value::as_str), args);
     let (code, output) =
         run_raw_cancellable(&args, Duration::from_secs(3), MAX_PREVIEW_BYTES, cancel).map_err(
             |error| {
@@ -3185,6 +3200,38 @@ esac"#;
             .unwrap_err()
             .contains("unreachable"));
         assert!(!calls(&log).iter().any(|call| call.contains("spare")));
+        remove_tree(&directory);
+    }
+
+    #[test]
+    fn remote_rows_run_their_herdr_calls_on_that_machine() {
+        let _guard = env_lock();
+        let (directory, command, log) = mock_machines("machines-execute");
+        std::env::set_var("HERDR_BIN_PATH", &command);
+        let snapshot = json!({
+            "workspaces": [{"workspace_id":"w1", "label":"Shop"}],
+            "agents": [{"agent":"claude", "agent_status":"idle", "pane_id":"w1:p1", "workspace_id":"w1", "tab_id":"t1"}]
+        });
+        let agent = machine_items(
+            items_from_snapshot_with_visits(&snapshot, "", &HashMap::new()),
+            "laptop",
+        )
+        .into_iter()
+        .find(|item| item["category"] == "Agents")
+        .unwrap();
+        assert_eq!(execute(&agent, ""), json!({"ok":true,"message":""}));
+        let _ = preview_cancellable(&agent, 0, &AtomicBool::new(false));
+        let _ = resource_details(&json!({"kind":"pane","paneId":"w1:p1","machine":"laptop"}));
+        std::env::remove_var("HERDR_BIN_PATH");
+        assert_eq!(
+            calls(&log),
+            [
+                "--machine laptop agent focus w1:p1",
+                "notification show Focused on laptop --body Switch to laptop in the Herdr sidebar to see it.",
+                "--machine laptop pane read w1:p1 --source visible --format text",
+                "--machine laptop pane process-info --pane w1:p1",
+            ]
+        );
         remove_tree(&directory);
     }
 
