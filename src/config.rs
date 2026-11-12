@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const MAX_HISTORY: usize = 200;
 const TOKENS: [&str; 19] = [
@@ -106,6 +107,53 @@ pub fn status_indicators_use_symbols() -> bool {
                 .map(|style| style == "symbols")
         })
         .unwrap_or(false)
+}
+
+/// Remote Herdr machines whose live rows Omni lists next to the local ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineSources {
+    pub include: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl MachineSources {
+    pub fn includes(&self, label: &str) -> bool {
+        self.include
+            .iter()
+            .any(|entry| entry == "*" || entry == label)
+    }
+}
+
+/// Omni's own settings live in the plugin config directory because Herdr warns
+/// about unknown keys in its config.toml.
+pub fn machine_sources() -> Option<MachineSources> {
+    let directory = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")?;
+    parse_machine_sources(&fs::read_to_string(Path::new(&directory).join("config.toml")).ok()?)
+}
+
+fn parse_machine_sources(source: &str) -> Option<MachineSources> {
+    let config = source.parse::<toml::Value>().ok()?;
+    let machines = config.get("machines")?;
+    if machines.get("enabled")?.as_bool() != Some(true) {
+        return None;
+    }
+    let include = match machines.get("include") {
+        Some(toml::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        _ => vec!["*".to_string()],
+    };
+    let timeout_ms = machines
+        .get("timeout_ms")
+        .and_then(toml::Value::as_integer)
+        .filter(|value| *value > 0)
+        .unwrap_or(1500);
+    Some(MachineSources {
+        include,
+        timeout: Duration::from_millis(timeout_ms as u64),
+    })
 }
 
 fn normalize_name(name: &str) -> String {
@@ -514,5 +562,46 @@ pub fn record_selection(id: &str) {
     let bytes = serde_json::to_vec_pretty(&Value::Object(bounded)).unwrap_or_default();
     if file.write_all(&bytes).is_err() || fs::rename(&temporary, &path).is_err() {
         let _ = fs::remove_file(&temporary);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_sources_are_off_unless_enabled() {
+        assert_eq!(parse_machine_sources(""), None);
+        assert_eq!(parse_machine_sources("[machines]\n"), None);
+        assert_eq!(parse_machine_sources("[machines]\nenabled = false\n"), None);
+        assert_eq!(
+            parse_machine_sources("[machines]\nenabled = \"yes\"\n"),
+            None
+        );
+        assert_eq!(parse_machine_sources("not toml ["), None);
+    }
+
+    #[test]
+    fn machine_sources_default_to_every_machine_within_budget() {
+        let sources = parse_machine_sources("[machines]\nenabled = true\n").unwrap();
+        assert_eq!(sources.timeout, Duration::from_millis(1500));
+        assert!(sources.includes("laptop"));
+        assert!(sources.includes("desktop"));
+    }
+
+    #[test]
+    fn machine_sources_honor_include_and_timeout() {
+        let sources = parse_machine_sources(
+            "[machines]\nenabled = true\ninclude = [\"laptop\"]\ntimeout_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(sources.timeout, Duration::from_millis(250));
+        assert!(sources.includes("laptop"));
+        assert!(!sources.includes("desktop"));
+        let none = parse_machine_sources("[machines]\nenabled = true\ninclude = []\n").unwrap();
+        assert!(!none.includes("laptop"));
+        let invalid =
+            parse_machine_sources("[machines]\nenabled = true\ntimeout_ms = -5\n").unwrap();
+        assert_eq!(invalid.timeout, Duration::from_millis(1500));
     }
 }
