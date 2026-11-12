@@ -12,7 +12,7 @@ use ratatui::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -349,6 +349,7 @@ fn preview_lines(
 
 enum Message {
     Live(Result<Vec<Value>, String>),
+    Machines(Vec<backend::MachineItems>),
     Sessions(Result<Vec<Value>, String>),
     SessionsDone,
     Preview(String, Result<String, String>),
@@ -408,6 +409,8 @@ struct App {
     shutdown: Arc<AtomicBool>,
     base: Vec<Value>,
     live: Vec<Value>,
+    machines: BTreeMap<String, Vec<Value>>,
+    unavailable_machines: Vec<String>,
     saved: Vec<Value>,
     rows: Vec<Value>,
     history: Value,
@@ -483,6 +486,8 @@ impl App {
             shutdown: Arc::new(AtomicBool::new(false)),
             base: config::load_items(),
             live: vec![],
+            machines: BTreeMap::new(),
+            unavailable_machines: vec![],
             saved: vec![],
             rows: vec![],
             history: config::load_history(),
@@ -555,6 +560,28 @@ impl App {
         self.jobs.retain(|job| !job.is_finished());
         self.jobs.push(thread::spawn(job));
     }
+    fn poll(
+        &mut self,
+        tx: &Sender<Message>,
+        load: impl Fn(&AtomicBool) -> Message + Send + 'static,
+    ) {
+        let tx = tx.clone();
+        let cancel = self.shutdown.clone();
+        self.spawn(move || loop {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if tx.send(load(&cancel)).is_err() {
+                break;
+            }
+            for _ in 0..100 {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
     fn stop_jobs(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.cancel_scan.store(true, Ordering::Relaxed);
@@ -568,6 +595,7 @@ impl App {
         let old = self.rows.get(self.selected).cloned();
         let mut all_items = self.base.clone();
         all_items.extend(self.live.clone());
+        all_items.extend(self.machines.values().flatten().cloned());
         let combined = if self.editor.text.starts_with(['@', ':']) {
             all_items.clone()
         } else {
@@ -725,6 +753,20 @@ impl App {
                     }
                 }
             },
+            Message::Machines(results) => {
+                self.machines
+                    .retain(|label, _| results.iter().any(|result| result.label == *label));
+                self.unavailable_machines.clear();
+                for result in results {
+                    match result.items {
+                        Ok(items) => {
+                            self.machines.insert(result.label, items);
+                        }
+                        Err(_) => self.unavailable_machines.push(result.label),
+                    }
+                }
+                self.rebuild();
+            }
             Message::Sessions(r) => match r {
                 Ok(items) => {
                     for item in items {
@@ -1026,12 +1068,14 @@ impl App {
         if !self.demo && !self.detail_busy {
             let resource = &item["resourcePreview"];
             let target = match s(resource, "kind") {
-                "workspace" if !resource["branch"].is_string() => Some(
-                    json!({"kind":"workspace","workspaceId":resource["workspaceId"],"path":resource["paths"][0]}),
-                ),
-                "tab" if resource["panes"].get(self.pane).is_some() => {
-                    Some(json!({"kind":"pane","paneId":resource["panes"][self.pane]["id"]}))
+                "workspace" if !resource["branch"].is_string() && item["machine"].is_null() => {
+                    Some(
+                        json!({"kind":"workspace","workspaceId":resource["workspaceId"],"path":resource["paths"][0]}),
+                    )
                 }
+                "tab" if resource["panes"].get(self.pane).is_some() => Some(
+                    json!({"kind":"pane","paneId":resource["panes"][self.pane]["id"],"machine":item["machine"]}),
+                ),
                 _ => None,
             };
             if let Some(target) = target {
@@ -1961,6 +2005,11 @@ impl App {
                     }
                 )
             };
+            let suffix = match item["machine"].as_str() {
+                Some(machine) if suffix.is_empty() => machine.to_owned(),
+                Some(machine) => format!("{machine} · {suffix}"),
+                None => suffix,
+            };
             let positions = if section(item) == "Transcript matches" {
                 vec![]
             } else {
@@ -2355,11 +2404,16 @@ impl App {
             String::new()
         } else {
             format!(
-                "{}{}",
+                "{}{}{}",
                 if self.transcripts {
                     "esc back · content search on  "
                 } else {
                     "Ctrl+F · Search session content  "
+                },
+                if self.unavailable_machines.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} unavailable · ", self.unavailable_machines.join(", "))
                 },
                 if self.status == "Loading…" {
                     "Loading…".to_owned()
@@ -2427,25 +2481,14 @@ pub fn run(demo: bool) -> io::Result<()> {
             }
         }
     } else {
-        let live_tx = tx.clone();
-        let cancel = app.shutdown.clone();
-        app.spawn(move || loop {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            if live_tx
-                .send(Message::Live(backend::load_live_items_cancellable(&cancel)))
-                .is_err()
-            {
-                break;
-            }
-            for _ in 0..100 {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+        app.poll(&tx, |cancel| {
+            Message::Live(backend::load_live_items_cancellable(cancel))
         });
+        if config::machine_sources().is_some() {
+            app.poll(&tx, |cancel| {
+                Message::Machines(backend::load_machine_items_cancellable(cancel))
+            });
+        }
         let tx = tx.clone();
         let cancel = app.shutdown.clone();
         app.spawn(move || {
@@ -2527,6 +2570,81 @@ pub fn run(demo: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn agent_row(pane: &str, machine: Option<&str>) -> Value {
+        let mut row = json!({
+            "id": format!("live:agent:{pane}"), "title": "Task - Shop", "category": "Agents",
+            "aliases": ["claude"], "agentStatus": "idle", "livePaneId": pane,
+            "invocation": {"kind": "herdr", "argv": ["agent", "focus", pane]}
+        });
+        if let Some(machine) = machine {
+            row["id"] = json!(format!("live:agent:{pane}@{machine}"));
+            row["machine"] = json!(machine);
+            row["aliases"] = json!(["claude", machine]);
+        }
+        row
+    }
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn ids(app: &App) -> Vec<String> {
+        app.rows
+            .iter()
+            .map(|row| s(row, "id").to_owned())
+            .filter(|id| id.starts_with("live:"))
+            .collect()
+    }
+    #[test]
+    fn remote_machine_rows_merge_beside_local_rows_and_survive_failures() {
+        let mut app = App::new(true);
+        app.demo = false;
+        app.base.clear();
+        app.status.clear();
+        app.sessions_loading = false;
+        app.message(Message::Live(Ok(vec![agent_row("w1:p1", None)])));
+        app.message(Message::Machines(vec![
+            backend::MachineItems {
+                label: "laptop".into(),
+                items: Ok(vec![agent_row("w1:p1", Some("laptop"))]),
+            },
+            backend::MachineItems {
+                label: "desktop".into(),
+                items: Err("Herdr command timed out.".into()),
+            },
+        ]));
+        assert!(ids(&app).contains(&"live:agent:w1:p1".to_owned()));
+        assert!(ids(&app).contains(&"live:agent:w1:p1@laptop".to_owned()));
+        let frame = screen(&mut app);
+        assert!(frame.contains("laptop ·"), "{frame}");
+        assert!(frame.contains("desktop unavailable"), "{frame}");
+
+        app.editor.text = "laptop".into();
+        app.changed();
+        assert_eq!(ids(&app), ["live:agent:w1:p1@laptop"]);
+        app.editor.text.clear();
+        app.changed();
+
+        app.message(Message::Live(Ok(vec![agent_row("w1:p2", None)])));
+        assert!(ids(&app).contains(&"live:agent:w1:p1@laptop".to_owned()));
+        app.message(Message::Machines(vec![backend::MachineItems {
+            label: "laptop".into(),
+            items: Err("Herdr command timed out.".into()),
+        }]));
+        assert!(ids(&app).contains(&"live:agent:w1:p1@laptop".to_owned()));
+        assert!(ids(&app).contains(&"live:agent:w1:p2".to_owned()));
+        let frame = screen(&mut app);
+        assert!(frame.contains("laptop unavailable"), "{frame}");
+        assert!(!frame.contains("desktop unavailable"), "{frame}");
+    }
     #[test]
     fn every_dialog_survives_tiny_terminal_resize() {
         for width in [0, 1, 2, 4, 8, 12, 20] {
