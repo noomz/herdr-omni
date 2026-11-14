@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install the release matching this checkout. Source builds are explicit opt-in.
+# Build this checkout from source. This fork's code is in no upstream release, so
+# downloading the release is opt-in: HERDR_OMNI_BUILD_FROM_SOURCE=0.
 set -eu
 
 root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
@@ -13,7 +14,7 @@ stage=$(mktemp -d "$root/bin/.install.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
 trap 'exit 1' HUP INT TERM
 
-if [ "${HERDR_OMNI_BUILD_FROM_SOURCE:-0}" = 1 ]; then
+if [ "${HERDR_OMNI_BUILD_FROM_SOURCE:-1}" = 1 ]; then
     cargo build --release --locked --bin herdr-omni --target-dir "$root/target"
     cp target/release/herdr-omni "$stage/herdr-omni"
 else

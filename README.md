@@ -182,6 +182,33 @@ old conversation history as a live screen.
 Official installs offer updates in-app; press **Ctrl+U** when a notice appears.
 Reopen Omni after updating. Local checkouts and pinned installs are left alone.
 
+### Multiple machines
+
+Omni can also list workspaces, tabs, and agents from the other machines saved in
+Herdr (`herdr machine list`). This is off by default. To turn it on, add this to
+`config.toml` in Omni's plugin config directory. Run
+`herdr plugin config-dir herdr-omni` to print that directory.
+
+```toml
+[machines]
+enabled = true       # default false
+include = ["*"]      # machine labels to show; "*" means every enabled machine
+timeout_ms = 1500    # how long to wait for each machine's snapshot
+```
+
+Remote rows show the machine label beside the row. Type the label to find that
+machine's rows. Enter focuses the workspace, tab, or agent on that machine,
+and pane previews read from that machine.
+
+Herdr does not let plugins change which machine the client shows. After you focus
+a remote row, select that machine in Herdr's sidebar to see it. A notification
+reminds you.
+
+Remote rows do not offer worktree create, close, or open, or saved-session
+resume. **Ctrl+F** searches local transcripts only. If a machine does not respond
+in time, the footer shows `<label> unavailable` and Omni keeps that machine's last
+rows.
+
 ## Local development
 
 Source development requires [Rust](https://rustup.rs). Clone the repository,
